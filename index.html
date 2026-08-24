@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сердечно-сосудистая система — интерактивные симуляции</title>
+<style>
+ *{box-sizing:border-box}
+ body{margin:0;background:#0a0e1a;color:#dbe4ff;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:40px 16px}
+ h1{font-size:22px;margin:0 0 6px;color:#fff;text-align:center}
+ .sub{color:#7484ab;font-size:13px;margin-bottom:28px;text-align:center}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;width:min(960px,100%)}
+ a.card{display:block;background:#111731;border:1px solid #223;border-radius:12px;padding:18px;text-decoration:none;color:#dbe4ff;transition:border-color .15s}
+ a.card:hover{border-color:#4a5b96}
+ .card h2{font-size:15px;margin:0 0 8px}
+ .card p{font-size:12.5px;line-height:1.55;margin:0;color:#9fb0d8}
+ .tag{display:inline-block;font-size:10px;padding:2px 8px;border-radius:20px;margin-top:10px;letter-spacing:.4px}
+</style>
+</head>
+<body>
+<h1>Сердечно-сосудистая система в волнах</h1>
+<div class="sub">Интерактивные обучающие симуляции: физика пульсовой волны, насос, мышцы. Все расчёты — честные численные модели прямо в браузере.</div>
+
+<div class="grid">
+ <a class="card" href="cardio_wave_3d.html">
+   <h2>Пульсовая волна — 3D</h2>
+   <p>Волна давления бежит по упругой артерии, отражается от периферии и складывается с прямой. Вращение камеры мышью, разложение волны на составляющие, давление в мм рт. ст.</p>
+   <span class="tag" style="background:#3a1d2e;color:#ff8bd2">сосуд · отражение · усиление</span>
+ </a>
+ <a class="card" href="heart_pump.html">
+   <h2>Сердце как насос</h2>
+   <p>Четыре камеры, клапаны и проводящая система с задержкой в АВ-узле. Кровь проходит полный круг, внизу — кривые Виггера: ЭКГ, давления, объём ЛЖ.</p>
+   <span class="tag" style="background:#2e1d3a;color:#c77dff">двухступенчатая раскачка</span>
+ </a>
+ <a class="card" href="muscle_pump.html">
+   <h2>Мышцы — второе сердце</h2>
+   <p>Икра сжимает вену через клапаны — кровь идёт только вверх. Рядом саркомер: частые импульсы складываются в тетанус, редкие — в подёргивания.</p>
+   <span class="tag" style="background:#1d3324;color:#59d98c">помпа · Франк–Старлинг</span>
+ </a>
+ <a class="card" href="cardio_wave.html">
+   <h2>Пульсовая волна — 2D</h2>
+   <p>Первая плоская версия: то же уравнение волны без 3D-рендера. Полезно для сравнения и на слабых машинах.</p>
+   <span class="tag" style="background:#262c44;color:#8fa3c8">legacy</span>
+ </a>
+</div>
+</body>
+</html>
