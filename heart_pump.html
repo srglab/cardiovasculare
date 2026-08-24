@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сердце как насос: раскачка кровотока</title>
+<style>
+ *{box-sizing:border-box}
+ html,body{height:100%}
+ body{margin:0;background:#0a0e1a;color:#dbe4ff;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px;display:flex;flex-direction:column;height:100vh;overflow:hidden;padding:8px 14px;gap:8px}
+ .panel{width:min(1150px,100%);margin:0 auto}
+ h1{font-size:15px;margin:0;font-weight:600;text-align:center;color:#fff}
+ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;background:#0a0f22}
+ .controls{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:flex-end;background:#111731;padding:6px 12px;border-radius:10px;border:1px solid #223}
+ .ctl{display:flex;flex-direction:column;gap:2px;font-size:11px}
+ .ctl input[type=range]{width:150px;margin:0}
+ .btns{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+ button{background:#1d2749;color:#dbe4ff;border:1px solid #33406e;border-radius:7px;padding:5px 9px;cursor:pointer;font-size:12px}
+ button:hover{background:#28356b}
+ button.on{background:#245c3d;border-color:#3a8f61}
+ .scene-wrap{position:relative;flex:1 1 auto;min-height:140px;border-radius:10px;overflow:hidden;border:1px solid #223}
+ .chart-wrap{position:relative;flex:0 0 clamp(140px,24vh,215px);min-height:120px;border-radius:10px;overflow:hidden;border:1px solid #223}
+ #status{display:flex;flex-wrap:wrap;gap:4px 18px;align-items:center;font-size:12px;background:#111731;padding:5px 12px;border-radius:10px;border:1px solid #223}
+ #verdict{font-weight:600;color:#ffd166}
+ #hint{position:absolute;left:12px;top:10px;font-size:11px;color:#7484ab;pointer-events:none;line-height:1.5}
+</style>
+</head>
+<body>
+<h1>Сердце как двухступенчатый насос: проводящая система, клапаны и принцип раскачки кровотока</h1>
+
+<div class="controls panel">
+  <div class="ctl"><label>ЧСС: <b id="hrVal"></b> уд/мин</label><input id="hrSlider" type="range" min="40" max="160" value="70"></div>
+  <div class="ctl"><label>Замедление: <b id="spVal"></b></label><input id="spSlider" type="range" min="1" max="12" value="3"></div>
+  <div class="btns">
+    <button id="stepBtn">Фазы по шагам</button>
+    <button id="autoBtn" class="on">Авто</button>
+    <button id="pauseBtn">&#9208;</button>
+  </div>
+</div>
+
+<div class="scene-wrap panel">
+  <canvas id="scene"></canvas>
+  <div id="hint">частицы — клетки крови: <span style="color:#4da3ff">синие — венозная</span>, <span style="color:#ff5a5a">красные — артериальная</span><br>жёлтая вспышка бежит по проводящей системе сердца</div>
+</div>
+
+<div id="status" class="panel">
+  <span>Ударный объём: <b>75 мл</b></span>
+  <span>Минутный объём (МОС): <b id="coOut"></b></span>
+  <span>Фракция выброса: <b>58%</b></span>
+  <span id="verdict"></span>
+</div>
+
+<div class="chart-wrap panel"><canvas id="strip"></canvas></div>
+
+<script>
+'use strict';
+let HR = 70, slowMo = 3, paused = false, autoMode = true;
+let simT = 0;
+
+const sceneCv = document.getElementById('scene'),
+      sctx = sceneCv.getContext('2d'),
+      stripCv = document.getElementById('strip'),
+      stctx = stripCv.getContext('2d'),
+      sWrap = document.querySelector('.scene-wrap'),
+      cWrap = document.querySelector('.chart-wrap');
+let SW = 0, SH = 0, CW = 0, CH = 0;
+
+function watchCanvas(cv, cx, holder, setSize) {
+  const dpr = window.devicePixelRatio || 1;
+  new ResizeObserver(() => {
+    const r = holder.getBoundingClientRect();
+    cv.width = Math.max(60, Math.round(r.width * dpr));
+    cv.height = Math.max(60, Math.round(r.height * dpr));
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    setSize(r.width, r.height);
+  }).observe(holder);
+}
+watchCanvas(sceneCv, sctx, sWrap, (w, h) => { SW = w; SH = h; });
+watchCanvas(stripCv, stctx, cWrap, (w, h) => { CW = w; CH = h; });
+
+const period = () => 60 / HR;
+
+const sm = (a, b, x) => Math.max(0, Math.min(1, (x - a) / (b - a)));
+const pulse = (f, c, w) => Math.exp(-Math.pow((f - c) / w, 2));
+
+const cAtr = f => sm(0.03, 0.09, f) * (1 - sm(0.16, 0.25, f));
+const cVen = f => sm(0.155, 0.235, f) * (1 - sm(0.46, 0.58, f));
+
+function avTarget(f) { return (f < 0.155 || f >= 0.545) ? 1 : 0; }
+function semiTarget(f) { return (f >= 0.215 && f < 0.475) ? 1 : 0; }
+let avAnim = 1, semiAnim = 0;
+
+function ecg(f) {
+  return 0.15 * pulse(f, 0.045, 0.022)
+       - 0.08 * pulse(f, 0.138, 0.007)
+       + 1.0 * pulse(f, 0.152, 0.008)
+       - 0.18 * pulse(f, 0.166, 0.009)
+       + 0.28 * pulse(f, 0.30, 0.03);
+}
+
+function lvp(f) {
+  if (f < 0.155) return 6 + 6 * sm(0.56, 1, f);
+  if (f < 0.215) return 12 + 66 * sm(0.155, 0.215, f);
+  if (f < 0.475) {
+    const u = (f - 0.215) / 0.26;
+    return 82 + 38 * Math.pow(Math.sin(Math.PI * u), 0.85) - 12 * u;
+  }
+  return 70 - 63 * sm(0.475, 0.55, f);
+}
+
+function aop(f) {
+  if (f < 0.215) return 84 - 8 * sm(0, 0.21, f);
+  if (f < 0.475) {
+    const u = (f - 0.215) / 0.26;
+    return 80 + 40 * Math.pow(Math.sin(Math.PI * u), 0.7);
+  }
+  return 80 - 5 * sm(0.5, 1, f) + 6 * pulse(f, 0.495, 0.012);
+}
+
+function lap(f) {
+  return 8 + 5 * pulse(f, 0.09, 0.035) - 3 * pulse(f, 0.30, 0.05) + 4 * pulse(f, 0.52, 0.05);
+}
+
+function lvv(f) {
+  if (f < 0.215) return 130;
+  if (f < 0.475) return 130 - 75 * sm(0.215, 0.475, f);
+  return 55 + 75 * Math.pow(sm(0.55, 0.985, f), 0.85);
+}
+
+const CHAMBERS = [
+  { n: 'ПП', x: 26, y: 32, rx: 14, ry: 10.5, atr: true },
+  { n: 'ПЖ', x: 27, y: 67, rx: 16, ry: 16.5, atr: false },
+  { n: 'ЛП', x: 63, y: 33, rx: 12, ry: 9, atr: true },
+  { n: 'ЛЖ', x: 65, y: 69, rx: 17, ry: 18.5, atr: false }
+];
+
+const VESSELS = [
+  { pts: [[4, 14], [16, 14], [22, 20]], w: 6, col: '#3a76c4' },
+  { pts: [[29, 55], [31, 38], [37, 27], [62, 21], [96, 19]], w: 6.5, col: '#3a76c4' },
+  { pts: [[96, 30], [78, 30], [70, 32]], w: 5.5, col: '#c43a3a' },
+  { pts: [[60, 58], [59, 44], [58, 30], [66, 19], [96, 14]], w: 7, col: '#c43a3a' }
+];
+
+const SEGS = [
+  { pts: [[2, 14], [16, 14], [23, 21], [26, 28]], type: 'vein', tau: 2.0, next: 1, recolor: 'blue' },
+  { pts: [[26, 36], [26, 50], [27, 58]], type: 'av', tau: 0.9, next: 2 },
+  { pts: [[29, 56], [31, 40], [37, 29], [62, 22], [95, 20]], type: 'semi', tau: 1.0, next: 3 },
+  { pts: [[95, 30], [78, 30], [66, 32]], type: 'vein', tau: 1.6, next: 4, recolor: 'red' },
+  { pts: [[63, 38], [63, 50], [64, 58]], type: 'av', tau: 0.9, next: 5 },
+  { pts: [[60, 58], [59, 44], [58, 30], [66, 19], [98, 15]], type: 'semi', tau: 1.0, next: 0 }
+];
+for (const s of SEGS) {
+  s.cum = [0];
+  for (let i = 1; i < s.pts.length; i++) {
+    const dx = s.pts[i][0] - s.pts[i - 1][0], dy = s.pts[i][1] - s.pts[i - 1][1];
+    s.cum.push(s.cum[i - 1] + Math.hypot(dx, dy));
+  }
+  s.len = s.cum[s.cum.length - 1];
+}
+function pathPoint(seg, u) {
+  const d = u * seg.len;
+  let i = 1;
+  while (i < seg.cum.length - 1 && seg.cum[i] < d) i++;
+  const k = (d - seg.cum[i - 1]) / (seg.cum[i] - seg.cum[i - 1]);
+  return [
+    seg.pts[i - 1][0] + (seg.pts[i][0] - seg.pts[i - 1][0]) * k,
+    seg.pts[i - 1][1] + (seg.pts[i][1] - seg.pts[i - 1][1]) * k
+  ];
+}
+
+const NP = 210;
+const parts = [];
+{
+  const weights = SEGS.map(s => s.tau);
+  const totW = weights.reduce((a, b) => a + b, 0);
+  for (let i = 0; i < NP; i++) {
+    let r = Math.random() * totW, si = 0;
+    while (r > weights[si]) { r -= weights[si]; si++; }
+    parts.push({ si, u: Math.random(), col: si < 3 ? 'blue' : 'red' });
+  }
+}
+
+function segMult(s, f) {
+  if (s.type === 'vein') return 0.75;
+  if (s.type === 'av') return 0.12 + 1.7 * avAnim + 1.3 * cAtr(f);
+  return 0.03 + 2.3 * semiAnim;
+}
+
+function advanceParts(dtSim) {
+  const T = period();
+  const f = (simT % T) / T;
+  for (const p of parts) {
+    p.u += segMult(SEGS[p.si], f) * dtSim / SEGS[p.si].tau;
+    while (p.u >= 1) {
+      p.u -= 1;
+      p.si = SEGS[p.si].next;
+      const ns = SEGS[p.si];
+      if (ns.recolor) p.col = ns.recolor;
+    }
+    if (p.u < 0) p.u = 0.001;
+  }
+}
+
+const VALVES = [
+  { n: 'трикуспидальный', x: 26, y: 50.5, dx: 0, dy: 1, w: 11, get open() { return avAnim; } },
+  { n: 'митральный', x: 63, y: 50.5, dx: 0, dy: 1, w: 10, get open() { return avAnim; } },
+  { n: 'пульмональный', x: 30.2, y: 44, dx: 0.25, dy: -1, w: 8, get open() { return semiAnim; } },
+  { n: 'аортальный', x: 58.8, y: 44, dx: -0.1, dy: -1, w: 8.5, get open() { return semiAnim; } }
+];
+
+const NODES = { sa: [22, 22], av: [45, 51] };
+const COND = [
+  { pts: [[22, 22], [30, 24], [38, 30]], t0: 0.0, t1: 0.05 },
+  { pts: [[22, 22], [16, 26], [14, 32]], t0: 0.005, t1: 0.06 },
+  { pts: [[45, 51], [45, 62], [45, 74]], t0: 0.155, t1: 0.185 },
+  { pts: [[45, 62], [58, 70], [72, 76]], t0: 0.165, t1: 0.205 },
+  { pts: [[45, 62], [34, 70], [24, 74]], t0: 0.165, t1: 0.205 },
+  { pts: [[45, 74], [56, 84]], t0: 0.175, t1: 0.21 },
+  { pts: [[45, 74], [34, 84]], t0: 0.175, t1: 0.21 }
+];
+
+const PHASES = [
+  [0.00, '① Синусовый узел запускает волну: предсердия возбуждаются', '#ffd166'],
+  [0.03, '② Систола предсердий: дожим +25% объёма в желудочки', '#ffb14d'],
+  [0.115, '⏸ Импульс задержан в АВ-узле (~0.12 с): желудочки дополнены до отказа', '#ff8bd2'],
+  [0.155, '④ Все клапаны закрыты: давление растёт при неизменном объёме', '#ff7b72'],
+  [0.215, '⑤ ВЫБРОС: полулунные клапаны открыты, ЛЖ разгоняет кровь в аорту', '#ff5a5a'],
+  [0.475, '⑥ Полулунные закрылись (II тон): желудочки расслабляются', '#58c4ff'],
+  [0.56, '⑦ Диастола: желудочки наполняются — насос снова заряжается', '#59d98c']
+];
+
+let K = 1, OX = 0, OY = 0;
+function updateTransform() {
+  K = Math.min(SW / 112, (SH - 30) / 106);
+  OX = (SW - 100 * K) / 2;
+  OY = 26 + (SH - 26 - 100 * K) / 2;
+}
+const TX = x => OX + x * K;
+const TY = y => OY + y * K;
+
+function drawTube(g, pts, w, col) {
+  g.strokeStyle = col;
+  g.lineWidth = w * K;
+  g.lineCap = 'round';
+  g.lineJoin = 'round';
+  g.beginPath();
+  g.moveTo(TX(pts[0][0]), TY(pts[0][1]));
+  for (let i = 1; i < pts.length; i++) g.lineTo(TX(pts[i][0]), TY(pts[i][1]));
+  g.stroke();
+}
+
+function drawScene(dtReal) {
+  if (!SW || !SH) return;
+  const g = sctx;
+  g.clearRect(0, 0, SW, SH);
+  updateTransform();
+
+  const T = period();
+  const f = (simT % T) / T;
+
+  const avT = avTarget(f), seT = semiTarget(f);
+  const rate = 1 - Math.exp(-14 * dtReal);
+  avAnim += (avT - avAnim) * rate;
+  semiAnim += (seT - semiAnim) * rate;
+
+  for (const v of VESSELS) drawTube(g, v.pts, v.w, v.col);
+
+  for (const ch of CHAMBERS) {
+    const c = ch.atr ? cAtr(f) : cVen(f);
+    const sc = 1 - 0.42 * c;
+    const rx = ch.rx * sc * K, ry = ch.ry * sc * K;
+    const wall = (ch.atr ? 4.5 : ch.n === 'ЛЖ' ? 12 : 7.5) * (0.8 + 0.7 * c) * K;
+    g.strokeStyle = '#8e2430';
+    g.lineWidth = wall;
+    g.beginPath();
+    g.ellipse(TX(ch.x), TY(ch.y), rx + wall * 0.42, ry + wall * 0.42, 0, 0, Math.PI * 2);
+    g.stroke();
+    g.fillStyle = ch.atr ? '#2a1636' : '#301322';
+    g.beginPath();
+    g.ellipse(TX(ch.x), TY(ch.y), rx, ry, 0, 0, Math.PI * 2);
+    g.fill();
+  }
+
+  g.strokeStyle = '#8e2430';
+  g.lineWidth = 8 * K;
+  g.beginPath(); g.moveTo(TX(45.5), TY(52)); g.lineTo(TX(45.5), TY(86)); g.stroke();
+  g.lineWidth = 5 * K;
+  g.beginPath(); g.moveTo(TX(44), TY(26)); g.lineTo(TX(44), TY(44)); g.stroke();
+
+  g.fillStyle = 'rgba(190,214,255,0.9)';
+  for (const p of parts) {
+    const s = SEGS[p.si];
+    const [ux, uy] = pathPoint(s, p.u);
+    g.fillStyle = p.col === 'blue' ? 'rgba(77,163,255,0.9)' : 'rgba(255,90,90,0.9)';
+    g.beginPath();
+    g.arc(TX(ux), TY(uy), Math.max(1.6, 2.6 * K / 7), 0, Math.PI * 2);
+    g.fill();
+  }
+
+  for (const v of VALVES) {
+    const ang = v.open * 1.15;
+    const px = TX(v.x), py = TY(v.y);
+    const nx = -v.dy, ny = v.dx;
+    const hl = v.w * 0.55 * K;
+    g.strokeStyle = '#ffe08a';
+    g.lineWidth = Math.max(1.6, 1.9 * K / 6);
+    for (const sgn of [-1, 1]) {
+      const hx = px + sgn * nx * v.w * 0.5 * K, hy = py + sgn * ny * v.w * 0.5 * K;
+      const fa = Math.atan2(v.dy, v.dx) + sgn * (ang - 0.32);
+      g.beginPath();
+      g.moveTo(hx, hy);
+      g.lineTo(hx + Math.cos(fa) * hl, hy + Math.sin(fa) * hl);
+      g.stroke();
+    }
+  }
+
+  const atrFlash = pulse(f, 0.04, 0.045) + 0.35 * cAtr(f);
+  const venFlash = pulse(f, 0.18, 0.035);
+  const avGlow = pulse(f, 0.105, 0.02);
+  const avWait = sm(0.105, 0.125, f) * (1 - sm(0.15, 0.165, f));
+
+  g.fillStyle = `rgba(255,209,102,${Math.min(1, atrFlash)})`;
+  g.beginPath(); g.arc(TX(NODES.sa[0]), TY(NODES.sa[1]), 4.5 * K / 5 + 3, 0, Math.PI * 2); g.fill();
+  g.fillStyle = `rgba(255,138,210,${Math.min(1, avGlow + avWait * 0.8)})`;
+  g.beginPath(); g.arc(TX(NODES.av[0]), TY(NODES.av[1]), 4 * K / 5 + 3, 0, Math.PI * 2); g.fill();
+
+  for (const cd of COND) {
+    const act = sm(cd.t0, cd.t1, f) * (1 - sm(cd.t1, cd.t1 + 0.1, f));
+    if (act <= 0.01) continue;
+    g.strokeStyle = `rgba(255,209,102,${act})`;
+    g.lineWidth = Math.max(1.5, 1.8 * K / 6);
+    g.beginPath();
+    g.moveTo(TX(cd.pts[0][0]), TY(cd.pts[0][1]));
+    for (let i = 1; i < cd.pts.length; i++) g.lineTo(TX(cd.pts[i][0]), TY(cd.pts[i][1]));
+    g.stroke();
+  }
+
+  const atrGlowAll = Math.min(1, atrFlash);
+  if (atrGlowAll > 0.03) {
+    g.strokeStyle = `rgba(255,209,102,${atrGlowAll * 0.55})`;
+    g.lineWidth = 2 * K / 5;
+    for (const ch of CHAMBERS.slice(0, 2)) {
+      g.beginPath();
+      g.ellipse(TX(ch.x), TY(ch.y), (ch.rx + 5) * K, (ch.ry + 5) * K, 0, 0, Math.PI * 2);
+      g.stroke();
+    }
+  }
+  if (venFlash > 0.03) {
+    g.strokeStyle = `rgba(255,209,102,${venFlash * 0.6})`;
+    g.lineWidth = 2 * K / 5;
+    for (const ch of CHAMBERS.slice(2)) {
+      g.beginPath();
+      g.ellipse(TX(ch.x), TY(ch.y), (ch.rx + 6) * K, (ch.ry + 6) * K, 0, 0, Math.PI * 2);
+      g.stroke();
+    }
+  }
+
+  g.font = `${Math.max(10, 11 * K / 6)}px sans-serif`;
+  g.textAlign = 'center';
+  const lbls = [
+    ['ПП', 26, 32], ['ПЖ', 27, 67], ['ЛП', 63, 33], ['ЛЖ', 65, 69],
+    ['полые вены', 12, 8], ['к лёгким →', 80, 13], ['от лёгких', 88, 36],
+    ['аорта → к организму', 82, 8], ['миокард ЛЖ — самый толстый', 65, 93]
+  ];
+  for (const [t, x, y] of lbls) {
+    g.fillStyle = 'rgba(10,14,26,0.75)';
+    const w = g.measureText(t).width;
+    g.fillRect(TX(x) - w / 2 - 4, TY(y) - 9, w + 8, 14);
+    g.fillStyle = '#9fb0d8';
+    g.fillText(t, TX(x), TY(y) + 2);
+  }
+
+  const s1 = pulse(f, 0.158, 0.012), s2 = pulse(f, 0.478, 0.012);
+  if (s1 > 0.05 || s2 > 0.05) {
+    const tone = s1 > s2;
+    g.fillStyle = tone ? `rgba(255,123,114,${s1})` : `rgba(88,196,255,${s2})`;
+    g.font = `bold ${Math.max(12, 15 * K / 6)}px sans-serif`;
+    g.textAlign = 'left';
+    g.fillText(tone ? 'I тон (захлопнулись АВ-клапаны)' : 'II тон (захлопнулись полулунные)', TX(2), TY(99));
+  }
+
+  let ph = PHASES[PHASES.length - 1];
+  for (const p of PHASES) { if (f >= p[0]) ph = p; }
+  g.font = '600 13px sans-serif';
+  const tw = g.measureText(ph[1]).width + 28;
+  const bx = (SW - tw) / 2, by = SH - 34;
+  g.fillStyle = 'rgba(13,18,38,0.85)';
+  g.beginPath();
+  g.roundRect(bx, by, tw, 27, 8);
+  g.fill();
+  g.strokeStyle = ph[2];
+  g.lineWidth = 1.2;
+  g.roundRect(bx, by, tw, 27, 8);
+  g.stroke();
+  g.fillStyle = ph[2];
+  g.textAlign = 'left';
+  g.textBaseline = 'middle';
+  g.fillText(ph[1], bx + 14, by + 14);
+  g.textBaseline = 'alphabetic';
+
+  g.fillStyle = '#ffd166';
+  g.font = 'bold 12px sans-serif';
+  g.textAlign = 'center';
+  g.fillText(`удар №${Math.floor(simT / T) + 1}`, TX(26), TY(14) + 26);
+}
+
+function drawStrip() {
+  if (!CW || !CH) return;
+  const g = stctx;
+  g.clearRect(0, 0, CW, CH);
+  const T = period();
+  const win = 2 * T;
+  const t0 = simT - win;
+  const padL = 30, padR = 34, padT = 18, padB = 16;
+  const pw = CW - padL - padR, ph = CH - padT - padB;
+  const xOf = t => padL + (t - t0) / win * pw;
+  const yP = mm => padT + (1 - mm / 140) * ph;
+  const yV = ml => padT + (1 - (ml - 40) / 110) * ph;
+  const yE = mv => padT + (0.62 - mv * 0.42) * ph;
+
+  const bands = [
+    [0.56, 1.0, 'наполнение'], [0.0, 0.03, ''], [0.03, 0.155, 'систола предсердий'],
+    [0.155, 0.215, 'изовул. сокр.'], [0.215, 0.475, 'ВЫБРОС'], [0.475, 0.56, 'изовул. расслабл.']
+  ];
+  g.font = '9px sans-serif';
+  g.textAlign = 'center';
+  for (const [a, b, nm] of bands) {
+    if (!nm) continue;
+    for (let cyc = Math.floor(t0 / T); cyc * T < simT + win; cyc++) {
+      const ta = cyc * T + a * T, tb = cyc * T + b * T;
+      const xa = Math.max(padL, xOf(ta)), xb = Math.min(CW - padR, xOf(tb));
+      if (xb <= xa) continue;
+      g.fillStyle = nm === 'ВЫБРОС' ? 'rgba(255,90,90,0.08)' : 'rgba(120,150,220,0.05)';
+      g.fillRect(xa, padT, xb - xa, ph);
+      if (nm && tb < simT && xa > padL) {
+        g.fillStyle = 'rgba(159,176,216,0.6)';
+        g.fillText(nm, (xa + xb) / 2, padT - 5);
+      }
+    }
+  }
+
+  g.strokeStyle = 'rgba(255,255,255,0.08)';
+  g.lineWidth = 1;
+  for (const m of [40, 80, 120]) {
+    g.beginPath(); g.moveTo(padL, yP(m)); g.lineTo(CW - padR, yP(m)); g.stroke();
+    g.fillStyle = '#5c6b8f';
+    g.textAlign = 'right';
+    g.fillText(m, padL - 4, yP(m) + 3);
+  }
+
+  const plot = (fn, yFn, color, width, dash) => {
+    g.strokeStyle = color;
+    g.lineWidth = width;
+    if (dash) g.setLineDash(dash);
+    g.beginPath();
+    const NPIX = Math.max(60, Math.floor(pw));
+    for (let i = 0; i <= NPIX; i++) {
+      const t = t0 + win * i / NPIX;
+      const fr = ((t % T) + T) % T / T;
+      const y = yFn(fn(fr));
+      const x = xOf(t);
+      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    }
+    g.stroke();
+    g.setLineDash([]);
+  };
+
+  plot(lvv, yV, 'rgba(230,230,240,0.75)', 1.4, [5, 4]);
+  plot(lap, yP, '#c77dff', 1.3);
+  plot(ecg, yE, '#59d98c', 1.6);
+  plot(aop, yP, '#ff5a5a', 2);
+  plot(lvp, yP, '#ffb14d', 2);
+
+  for (const [fr, lbl] of [[0.158, 'S1'], [0.478, 'S2']]) {
+    for (let cyc = Math.floor(t0 / T); cyc * T < simT; cyc++) {
+      const x = xOf(cyc * T + fr * T);
+      if (x < padL || x > CW - padR) continue;
+      g.strokeStyle = 'rgba(255,224,138,0.5)';
+      g.beginPath(); g.moveTo(x, padT); g.lineTo(x, padT + ph); g.stroke();
+      g.fillStyle = 'rgba(255,224,138,0.8)';
+      g.textAlign = 'left';
+      g.fillText(lbl, x + 3, padT + 9);
+    }
+  }
+
+  g.font = '10px sans-serif';
+  g.textAlign = 'left';
+  g.fillStyle = '#ffb14d'; g.fillText('— давление в ЛЖ', padL + 6, 12);
+  g.fillStyle = '#ff5a5a'; g.fillText('— аорта', padL + 118, 12);
+  g.fillStyle = '#c77dff'; g.fillText('— левое предсердие', padL + 178, 12);
+  g.fillStyle = '#d0d0e0'; g.fillText('- - объём ЛЖ, мл', padL + 306, 12);
+  g.fillStyle = '#59d98c'; g.fillText('— ЭКГ', CW - padR - 46, 12);
+  g.textAlign = 'left';
+  g.fillStyle = '#5c6b8f';
+  g.fillText('мм рт.ст.', 4, CH - 4);
+}
+
+const elCo = document.getElementById('coOut'),
+      elVerdict = document.getElementById('verdict');
+
+function updateStatus() {
+  const co = 75 * HR / 1000;
+  elCo.textContent = co.toFixed(1) + ' л/мин';
+  elVerdict.textContent =
+    `ЧСС ↑ → МОС ↑: сердце раскачивает поток сильнее (${co.toFixed(1)} л/мин при ${HR} уд/мин)`;
+}
+
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dtr = (now - last) / 1000;
+  last = now;
+  if (dtr > 0.08) dtr = 0.08;
+  const simDt = dtr / slowMo;
+  if (!paused) {
+    simT += simDt;
+    advanceParts(simDt);
+  }
+  drawScene(dtr);
+  drawStrip();
+  updateStatus();
+}
+
+document.getElementById('hrSlider').addEventListener('input', function () {
+  HR = +this.value;
+  document.getElementById('hrVal').textContent = HR;
+});
+document.getElementById('spSlider').addEventListener('input', function () {
+  slowMo = +this.value;
+  document.getElementById('spVal').textContent = '×' + slowMo;
+});
+document.getElementById('pauseBtn').addEventListener('click', function () {
+  paused = !paused;
+  this.innerHTML = paused ? '&#9654;' : '&#9208;';
+});
+
+const STEP_BOUNDS = [0.03, 0.115, 0.155, 0.215, 0.475, 0.56, 1.0001];
+document.getElementById('stepBtn').addEventListener('click', () => {
+  paused = true;
+  document.getElementById('pauseBtn').innerHTML = '&#9654;';
+  const T = period();
+  const f = (simT % T) / T;
+  let target = null;
+  for (const b of STEP_BOUNDS) {
+    if (b > f + 0.002) { target = b; break; }
+  }
+  if (target === null) target = STEP_BOUNDS[0] + T;
+  simT += (target - f) * T;
+});
+document.getElementById('autoBtn').addEventListener('click', function () {
+  autoMode = !autoMode;
+  paused = !autoMode;
+  this.classList.toggle('on', autoMode);
+  document.getElementById('pauseBtn').innerHTML = paused ? '&#9654;' : '&#9208;';
+});
+
+document.getElementById('hrVal').textContent = HR;
+document.getElementById('spVal').textContent = '×' + slowMo;
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

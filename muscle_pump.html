@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мышцы и кровоток: мышечная помпа + саркомер</title>
+<style>
+ *{box-sizing:border-box}
+ html,body{height:100%}
+ body{margin:0;background:#0a0e1a;color:#dbe4ff;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px;display:flex;flex-direction:column;height:100vh;overflow:hidden;padding:8px 14px;gap:8px}
+ .panel{width:min(1150px,100%);margin:0 auto}
+ h1{font-size:15px;margin:0;font-weight:600;text-align:center;color:#fff}
+ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;background:#0a0f22}
+ .controls{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:flex-end;background:#111731;padding:6px 12px;border-radius:10px;border:1px solid #223}
+ .ctl{display:flex;flex-direction:column;gap:2px;font-size:11px}
+ .ctl input[type=range]{width:150px;margin:0}
+ .btns{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap;align-items:center;font-size:11px;color:#7484ab}
+ button{background:#1d2749;color:#dbe4ff;border:1px solid #33406e;border-radius:7px;padding:5px 9px;cursor:pointer;font-size:12px}
+ button:hover{background:#28356b}
+ button.on{background:#245c3d;border-color:#3a8f61}
+ .scene-wrap{position:relative;flex:1 1 auto;min-height:140px;border-radius:10px;overflow:hidden;border:1px solid #223}
+ .chart-wrap{position:relative;flex:0 0 clamp(125px,23vh,205px);min-height:112px;border-radius:10px;overflow:hidden;border:1px solid #223}
+ #status{display:flex;flex-wrap:wrap;gap:4px 18px;align-items:center;font-size:12px;background:#111731;padding:5px 12px;border-radius:10px;border:1px solid #223}
+ #verdict{font-weight:600;color:#59d98c}
+ #hint{position:absolute;right:12px;top:10px;font-size:11px;color:#7484ab;pointer-events:none;text-align:right;line-height:1.5}
+</style>
+</head>
+<body>
+<h1>Скелетная мышца — «второе сердце»: мышечная помпа, венозные клапаны и суммация сокращений (тетанус)</h1>
+
+<div class="controls panel">
+  <div class="ctl"><label>Стимуляция нейронов: <b id="hzVal"></b> Гц</label><input id="hzSlider" type="range" min="1" max="30" value="5"></div>
+  <div class="ctl"><label>Замедление: <b id="spVal"></b></label><input id="spSlider" type="range" min="1" max="12" value="3"></div>
+  <div class="btns">
+    <span>режим:</span>
+    <button data-mode="rest">Покой</button>
+    <button data-mode="walk" class="on">Ходьба</button>
+    <button data-mode="run">Бег</button>
+    <button id="pauseBtn">&#9208;</button>
+  </div>
+</div>
+
+<div class="scene-wrap panel">
+  <canvas id="scene"></canvas>
+  <div id="hint">слева — помпа: сжатие гонит венозную кровь только вверх<br>справа — саркомер: частые импульсы суммируются в тетанус</div>
+</div>
+
+<div id="status" class="panel">
+  <span>Сила мышцы: <b id="fOut"></b></span>
+  <span>Венозный возврат: <b id="vrOut"></b></span>
+  <span id="verdict"></span>
+</div>
+
+<div class="chart-wrap panel"><canvas id="strip"></canvas></div>
+
+<script>
+'use strict';
+let hz = 5, slowMo = 3, paused = false, mode = 'walk';
+let simT = 0, act = 0, nextStim = 0;
+
+const MODE_STEP = { rest: 0, walk: 1.7, run: 3.2 };
+
+const sceneCv = document.getElementById('scene'),
+      sctx = sceneCv.getContext('2d'),
+      stripCv = document.getElementById('strip'),
+      stctx = stripCv.getContext('2d'),
+      sWrap = document.querySelector('.scene-wrap'),
+      cWrap = document.querySelector('.chart-wrap');
+let SW = 0, SH = 0, CW = 0, CH = 0;
+
+function watchCanvas(cv, cx, holder, setSize) {
+  const dpr = window.devicePixelRatio || 1;
+  new ResizeObserver(() => {
+    const r = holder.getBoundingClientRect();
+    cv.width = Math.max(60, Math.round(r.width * dpr));
+    cv.height = Math.max(60, Math.round(r.height * dpr));
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    setSize(r.width, r.height);
+  }).observe(holder);
+}
+watchCanvas(sceneCv, sctx, sWrap, (w, h) => { SW = w; SH = h; });
+watchCanvas(stripCv, stctx, cWrap, (w, h) => { CW = w; CH = h; });
+
+const sm = (a, b, x) => Math.max(0, Math.min(1, (x - a) / (b - a)));
+
+const TAU_CA = 0.24;
+function pumpC(t) {
+  const Ts = 1 / MODE_STEP[mode];
+  if (mode === 'rest' || Ts === 0) return 0;
+  const ph = ((t % Ts) + Ts) % Ts / Ts;
+  const u = Math.min(1, ph / 0.42);
+  return Math.pow(Math.sin(Math.PI * u), 1.4);
+}
+function actAt(t) {
+  if (hz <= 0) return 0;
+  const r = Math.exp(-1 / (hz * TAU_CA));
+  const frac = ((t * hz) % 1 + 1) % 1;
+  return Math.min(1.15, 0.85 * Math.pow(r, frac) / (1 - r));
+}
+
+let K = 1, OX = 0, OY = 0;
+function updateTransform() {
+  K = Math.min(SW / 106, (SH - 28) / 102);
+  OX = (SW - 100 * K) / 2;
+  OY = 24 + (SH - 24 - 100 * K) / 2;
+}
+const TX = x => OX + x * K;
+const TY = y => OY + y * K;
+
+const VALVE_YS = [76, 57, 38];
+const VEIN_TOP = 12, VEIN_BOT = 90;
+const NP_V = 64, NP_A = 22;
+const vPartU = [], aPartU = [];
+for (let i = 0; i < NP_V; i++) vPartU.push(Math.random());
+for (let i = 0; i < NP_A; i++) aPartU.push(Math.random());
+
+const SAR = { cx: 75, cy: 52, span: 34 };
+const caDots = [];
+for (let i = 0; i < 26; i++) caDots.push({ p: Math.random(), life: 0, side: i % 2 ? 1 : -1 });
+
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+function drawLabel(g, t, x, y, col) {
+  g.font = `${Math.max(9.5, 10.5 * K / 7)}px sans-serif`;
+  const w = g.measureText(t).width;
+  g.fillStyle = 'rgba(10,14,26,0.78)';
+  g.fillRect(TX(x) - w / 2 - 4, TY(y) - 9, w + 8, 14);
+  g.fillStyle = col || '#9fb0d8';
+  g.textAlign = 'center';
+  g.fillText(t, TX(x), TY(y) + 2);
+}
+
+function drawScene(dtReal) {
+  if (!SW || !SH) return;
+  const g = sctx;
+  g.clearRect(0, 0, SW, SH);
+  updateTransform();
+
+  const A = Math.min(1, act);
+  const cp = pumpC(simT);
+
+  g.strokeStyle = 'rgba(120,140,190,0.25)';
+  g.setLineDash([5, 6]);
+  g.lineWidth = 1;
+  g.beginPath(); g.moveTo(TX(51), TY(6)); g.lineTo(TX(51), TY(99)); g.stroke();
+  g.setLineDash([]);
+
+  g.font = `bold ${Math.max(11, 12.5 * K / 7)}px sans-serif`;
+  g.textAlign = 'center';
+  g.fillStyle = '#dbe4ff';
+  g.fillText('Мышечная помпа', TX(24), TY(3));
+  g.fillText('Сокращение саркомера', TX(77), TY(3));
+
+  g.strokeStyle = '#e8d9c8';
+  g.lineWidth = Math.max(2, 3.4 * K / 7);
+  g.beginPath();
+  g.moveTo(TX(17), TY(16)); g.lineTo(TX(16), TY(94));
+  g.stroke();
+
+  const mw = 1 - 0.30 * cp, mh = 1 - 0.13 * cp;
+  g.fillStyle = '#7a2030';
+  g.beginPath();
+  g.ellipse(TX(29), TY(50), 11.5 * mw * K, 26 * mh * K, 0, 0, Math.PI * 2);
+  g.fill();
+  g.strokeStyle = '#a83a4a';
+  g.lineWidth = 1.4;
+  g.stroke();
+  g.strokeStyle = 'rgba(255,160,170,0.4)';
+  g.lineWidth = 1;
+  for (let i = -2; i <= 2; i++) {
+    g.beginPath();
+    g.ellipse(TX(29), TY(50), Math.max(1, 11.5 * mw * K * Math.abs(i) / 2.6),
+              Math.max(1, 26 * mh * K * Math.abs(i) / 2.6), 0, 0, Math.PI * 2);
+    g.stroke();
+  }
+
+  const vw = (5.2 - 2.6 * cp) * K;
+  g.strokeStyle = '#274b8f';
+  g.lineWidth = vw;
+  g.lineCap = 'round';
+  g.beginPath(); g.moveTo(TX(21.5), TY(VEIN_BOT)); g.lineTo(TX(21.5), TY(VEIN_TOP)); g.stroke();
+  g.strokeStyle = '#c43a3a';
+  g.lineWidth = 2.4 * K / 7;
+  g.beginPath(); g.moveTo(TX(12.5), TY(VEIN_TOP)); g.lineTo(TX(12.5), TY(VEIN_BOT)); g.stroke();
+
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = 'rgba(120,180,255,0.85)';
+  for (let i = 0; i < NP_V; i++) {
+    const y = VEIN_BOT - vPartU[i] * (VEIN_BOT - VEIN_TOP);
+    g.beginPath();
+    g.arc(TX(21.5), TY(y), Math.max(1.3, 2 * K / 7), 0, Math.PI * 2);
+    g.fill();
+  }
+  g.fillStyle = 'rgba(255,130,130,0.85)';
+  for (let i = 0; i < NP_A; i++) {
+    const y = VEIN_TOP + aPartU[i] * (VEIN_BOT - VEIN_TOP);
+    g.beginPath();
+    g.arc(TX(12.5), TY(y), Math.max(1.2, 1.8 * K / 7), 0, Math.PI * 2);
+    g.fill();
+  }
+  g.restore();
+
+  const vOpen = cp > 0.45 ? Math.min(1, (cp - 0.45) / 0.2) : 0;
+  for (const vy of VALVE_YS) {
+    const px = TX(21.5), py = TY(vy);
+    g.strokeStyle = '#ffe08a';
+    g.lineWidth = Math.max(1.4, 1.7 * K / 7);
+    const hl = vw * 0.62;
+    for (const sgn of [-1, 1]) {
+      const fa = Math.PI / 2 + sgn * (vOpen * 1.25 - 0.3);
+      g.beginPath();
+      g.moveTo(px + sgn * vw * 0.42, py);
+      g.lineTo(px + sgn * vw * 0.42 + Math.cos(fa) * hl, py + Math.sin(fa) * hl);
+      g.stroke();
+    }
+  }
+
+  g.fillStyle = '#ffd166';
+  g.font = `bold ${Math.max(11, 12 * K / 7)}px sans-serif`;
+  g.textAlign = 'center';
+  g.fillText(mode === 'rest' ? 'мышца бездействует' : cp > 0.45 ? 'СЖАТИЕ →' : 'расслабление',
+             TX(24), TY(97));
+
+  drawLabel(g, 'к сердцу ↑', 21.5, 7, '#8fb8ff');
+  drawLabel(g, 'глубокая вена + клапаны', 33.5, 66, '#8fb8ff');
+  drawLabel(g, 'икроножная мышца', 29, 82, '#ffb3bd');
+  drawLabel(g, 'артерия (вниз)', 8, 50, '#ff9d9d');
+
+  const Lrel = SAR.span, Lmin = SAR.span * 0.46;
+  const L = Lrel - (Lrel - Lmin) * A;
+  const zl = SAR.cx - L / 2, zr = SAR.cx + L / 2;
+  const la = SAR.span * 0.37, lm = SAR.span * 0.30;
+  const yTop = SAR.cy - 11, yBot = SAR.cy + 11;
+
+  g.fillStyle = 'rgba(70,90,140,0.35)';
+  roundRect(g, TX(zl - 9), TY(SAR.cy - 15), TX(zr + 9) - TX(zl - 9), TY(SAR.cy + 15) - TY(SAR.cy - 15), 6 * K / 7);
+  g.fill();
+  g.strokeStyle = '#58c4ff';
+  g.lineWidth = Math.max(2, 2.6 * K / 7);
+  for (const zx of [zl, zr]) {
+    g.beginPath(); g.moveTo(TX(zx), TY(yTop)); g.lineTo(TX(zx), TY(yBot)); g.stroke();
+  }
+  g.strokeStyle = 'rgba(210,225,255,0.85)';
+  g.lineWidth = Math.max(1, 1.2 * K / 7);
+  for (let i = 0; i <= 6; i++) {
+    const yy = yTop + (yBot - yTop) * i / 6;
+    g.beginPath(); g.moveTo(TX(zl), TY(yy)); g.lineTo(TX(zl + la), TY(yy)); g.stroke();
+    g.beginPath(); g.moveTo(TX(zr), TY(yy)); g.lineTo(TX(zr - la), TY(yy)); g.stroke();
+  }
+  g.strokeStyle = '#ff8bd2';
+  g.lineWidth = Math.max(3, 4.4 * K / 7);
+  g.beginPath(); g.moveTo(TX(SAR.cx - lm / 2), TY(SAR.cy)); g.lineTo(TX(SAR.cx + lm / 2), TY(SAR.cy)); g.stroke();
+  g.strokeStyle = '#ffd166';
+  g.lineWidth = Math.max(1.2, 1.5 * K / 7);
+  const rowPhase = simT * (3 + 9 * A);
+  for (let hx = -lm / 2 + 1.6; hx <= lm / 2 - 1.6; hx += 2.4) {
+    for (const sgn of [-1, 1]) {
+      const wob = A * Math.sin(rowPhase + hx * 1.7 + (sgn > 0 ? Math.PI : 0)) * 0.5;
+      const ang = sgn * (0.95 + wob);
+      const bx = SAR.cx + hx, by = SAR.cy + sgn * 2.2;
+      g.beginPath();
+      g.moveTo(TX(bx), TY(by));
+      g.lineTo(TX(bx + Math.cos(ang) * 2.6), TY(by + Math.sin(ang) * 2.6));
+      g.stroke();
+    }
+  }
+
+  const srY = [SAR.cy - 17.5, SAR.cy + 17.5];
+  g.strokeStyle = 'rgba(120,200,150,0.65)';
+  g.lineWidth = Math.max(2.5, 3 * K / 7);
+  for (const sy of srY) {
+    g.beginPath(); g.moveTo(TX(zl - 6), TY(sy)); g.lineTo(TX(zr + 6), TY(sy)); g.stroke();
+  }
+  const caRelease = Math.min(1, act * 1.4);
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  for (const d of caDots) {
+    if (d.life <= 0) continue;
+    const yy = SAR.cy + d.side * (17.5 - d.p * 15);
+    const xx = zl - 4 + d.p * (L + 8);
+    g.fillStyle = `rgba(255,170,80,${0.75 * d.life})`;
+    g.beginPath();
+    g.arc(TX(xx), TY(yy), Math.max(1.2, 1.7 * K / 7), 0, Math.PI * 2);
+    g.fill();
+  }
+  g.restore();
+
+  drawLabel(g, 'Z-диск', zl, yTop - 4, '#58c4ff');
+  drawLabel(g, 'актин', zl + la * 0.55, yBot + 6, '#d0e0ff');
+  drawLabel(g, 'миозин + мостики', SAR.cx, yBot + 12, '#ff8bd2');
+  drawLabel(g, 'SR: выброс Ca²⁺', SAR.cx, yTop - 10, caRelease > 0.15 ? '#ffc37a' : '#74848f');
+  drawLabel(g, `саркомер: −${Math.round((1 - L / Lrel) * 100)}% длины`, SAR.cx, yTop - 16, '#dbe4ff');
+
+  let capText, capCol;
+  if (hz < 3.5) { capText = '① Редкие импульсы: одиночные подёргивания — раскачки нет'; capCol = '#8fa3c8'; }
+  else if (hz < 14) { capText = '② Зубчатый плато: хвосты Ca²⁺ складываются — неполный тетанус'; capCol = '#ffb14d'; }
+  else { capText = '③ Частые импульсы: гладкое плато максимума — гладкий тетанус'; capCol = '#ff7b72'; }
+  g.font = '600 13px sans-serif';
+  const tw = g.measureText(capText).width + 28;
+  const bx = (TX(51) - tw) / 2 + 2, by = SH - 32;
+  g.fillStyle = 'rgba(13,18,38,0.85)';
+  roundRect(g, bx, by, tw, 26, 8);
+  g.fill();
+  g.strokeStyle = capCol;
+  g.lineWidth = 1.2;
+  roundRect(g, bx, by, tw, 26, 8);
+  g.stroke();
+  g.fillStyle = capCol;
+  g.textAlign = 'left';
+  g.textBaseline = 'middle';
+  g.fillText(capText, bx + 14, by + 13.5);
+  g.textBaseline = 'alphabetic';
+
+  if (mode !== 'rest') {
+    g.fillStyle = cp > 0.45 ? 'rgba(89,217,140,0.9)' : 'rgba(143,163,200,0.7)';
+    g.font = '600 12px sans-serif';
+    g.textAlign = 'left';
+    g.fillText(cp > 0.45
+      ? 'мышца сжала вену: клапаны открыты, кровь идёт ТОЛЬКО вверх'
+      : 'вена расправилась: клапаны заперты — обратного хода нет, вена наполняется',
+      12, SH - 12);
+  } else {
+    g.fillStyle = 'rgba(255,123,114,0.85)';
+    g.font = '600 12px sans-serif';
+    g.textAlign = 'left';
+    g.fillText('покой: помпа выключена — венозная кровь стоит, растёт риск застоя', 12, SH - 12);
+  }
+}
+
+function advance(dtSim) {
+  if (simT >= nextStim) {
+    act = Math.min(1.18, act + 0.85);
+    nextStim = simT + 1 / hz;
+  }
+  act *= Math.exp(-dtSim / TAU_CA);
+  if (act < 0.003) act = 0;
+
+  const cp = pumpC(simT);
+  if (cp > 0.02) {
+    const dv = cp * dtSim * 0.34;
+    for (let i = 0; i < NP_V; i++) {
+      vPartU[i] += dv;
+      if (vPartU[i] > 1) vPartU[i] -= 1;
+    }
+  }
+  for (let i = 0; i < NP_A; i++) {
+    aPartU[i] += dtSim * 0.075;
+    if (aPartU[i] > 1) aPartU[i] -= 1;
+  }
+
+  for (const d of caDots) {
+    d.life -= dtSim * 0.9;
+    if (d.life <= 0 && Math.random() < Math.min(0.9, act)) {
+      d.life = 1; d.p = 0;
+    }
+    if (d.life > 0) d.p += dtSim * 1.6;
+    if (d.p > 1) { d.p = 1; d.life -= dtSim * 2.2; }
+  }
+}
+
+let vrAvg = 0;
+function drawStrip() {
+  if (!CW || !CH) return;
+  const g = stctx;
+  g.clearRect(0, 0, CW, CH);
+  const win = 6;
+  const t0 = simT - win;
+  const padL = 34, padR = 40, padT = 18, padB = 15;
+  const pw = CW - padL - padR, ph = CH - padT - padB;
+  const xOf = t => padL + (t - t0) / win * pw;
+  const yF = q => padT + (1 - q / 115) * ph;
+  const yR = q => padT + (1 - q / 500) * ph;
+
+  g.strokeStyle = 'rgba(255,255,255,0.08)';
+  g.lineWidth = 1;
+  g.font = '9px sans-serif';
+  g.textAlign = 'right';
+  for (const m of [0, 25, 50, 75, 100]) {
+    g.beginPath(); g.moveTo(padL, yF(m)); g.lineTo(CW - padR, yF(m)); g.stroke();
+    g.fillStyle = '#5c6b8f';
+    g.fillText(m, padL - 4, yF(m) + 3);
+  }
+
+  const NPIX = Math.max(80, Math.floor(pw));
+  g.fillStyle = 'rgba(88,196,255,0.14)';
+  g.beginPath();
+  g.moveTo(xOf(t0), yR(0));
+  for (let i = 0; i <= NPIX; i++) {
+    const t = t0 + win * i / NPIX;
+    g.lineTo(xOf(t), yR(pumpC(t) * 420));
+  }
+  g.lineTo(CW - padR, yR(0));
+  g.closePath();
+  g.fill();
+
+  const plot = (fn, yFn, color, width) => {
+    g.strokeStyle = color;
+    g.lineWidth = width;
+    g.beginPath();
+    for (let i = 0; i <= NPIX; i++) {
+      const t = t0 + win * i / NPIX;
+      const y = yFn(fn(t));
+      if (i === 0) g.moveTo(xOf(t), y); else g.lineTo(xOf(t), y);
+    }
+    g.stroke();
+  };
+  plot(t => Math.min(110, actAt(t) * 96), yF, '#59d98c', 2);
+  plot(t => pumpC(t) * 420, yR, '#58c4ff', 1.6);
+
+  g.font = '10px sans-serif';
+  g.textAlign = 'left';
+  g.fillStyle = '#59d98c';
+  g.fillText('— сила (суммация → тетанус), %', padL + 6, 12);
+  g.fillStyle = '#58c4ff';
+  g.fillText('- венозный возврат (мышечная помпа), мл/мин', padL + 218, 12);
+
+  g.fillStyle = '#5c6b8f';
+  g.fillText('% силы', 4, padT + 8);
+  g.fillText('мл/мин', CW - 34, padT + 8);
+  g.fillText('6 с', CW - padR + 6, CH - 5);
+}
+
+const elF = document.getElementById('fOut'),
+      elVr = document.getElementById('vrOut'),
+      elVerdict = document.getElementById('verdict');
+
+function updateStatus() {
+  elF.textContent = Math.round(Math.min(1, act) * 100) + '%';
+  const inst = pumpC(simT) * 420;
+  vrAvg += (inst - vrAvg) * 0.04;
+  elVr.textContent = Math.round(vrAvg) + ' мл/мин';
+  const avgC = mode === 'rest' ? 0 : (mode === 'walk' ? 0.25 : 0.47);
+  elVerdict.textContent = mode === 'rest'
+    ? '⚠ Нет работы мышц → венозный возврат минимальный → сердце качает меньше'
+    : `Помпа активна: +${Math.round(avgC * 420)} мл/мин к возврату → сердце отвечает более сильным ударом (Франк–Старлинг)`;
+}
+
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dtr = (now - last) / 1000;
+  last = now;
+  if (dtr > 0.08) dtr = 0.08;
+  const simDt = dtr / slowMo;
+  if (!paused) {
+    simT += simDt;
+    advance(simDt);
+  }
+  drawScene(dtr);
+  drawStrip();
+  updateStatus();
+}
+
+document.getElementById('hzSlider').addEventListener('input', function () {
+  hz = +this.value;
+  document.getElementById('hzVal').textContent = hz;
+});
+document.getElementById('spSlider').addEventListener('input', function () {
+  slowMo = +this.value;
+  document.getElementById('spVal').textContent = '×' + slowMo;
+});
+document.getElementById('pauseBtn').addEventListener('click', function () {
+  paused = !paused;
+  this.innerHTML = paused ? '&#9654;' : '&#9208;';
+});
+document.querySelectorAll('button[data-mode]').forEach(b => {
+  b.addEventListener('click', () => {
+    mode = b.dataset.mode;
+    document.querySelectorAll('button[data-mode]').forEach(x => x.classList.toggle('on', x === b));
+  });
+});
+
+document.getElementById('hzVal').textContent = hz;
+document.getElementById('spVal').textContent = '×' + slowMo;
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

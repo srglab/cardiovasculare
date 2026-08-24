@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Пульсовая волна в артерии — 3D</title>
+<style>
+ *{box-sizing:border-box}
+ html,body{height:100%}
+ body{margin:0;background:#0a0e1a;color:#dbe4ff;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px;display:flex;flex-direction:column;height:100vh;overflow:hidden;padding:8px 14px;gap:8px}
+ .panel{width:min(1150px,100%);margin:0 auto}
+ h1{font-size:15px;margin:0;font-weight:600;text-align:center;color:#fff}
+ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;background:#0a0f22}
+ .controls{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:flex-end;background:#111731;padding:6px 12px;border-radius:10px;border:1px solid #223}
+ .ctl{display:flex;flex-direction:column;gap:2px;font-size:11px}
+ .ctl input[type=range]{width:150px;margin:0}
+ .btns{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+ button{background:#1d2749;color:#dbe4ff;border:1px solid #33406e;border-radius:7px;padding:5px 9px;cursor:pointer;font-size:12px}
+ button:hover{background:#28356b}
+ button.warn{background:#4a1d24;border-color:#7e3038}
+ .vessel-wrap{position:relative;flex:1 1 auto;min-height:140px;border-radius:10px;overflow:hidden;border:1px solid #223}
+ .chart-wrap{position:relative;flex:0 0 clamp(125px,25vh,220px);min-height:112px;border-radius:10px;overflow:hidden;border:1px solid #223}
+ #status{display:flex;flex-wrap:wrap;gap:4px 18px;align-items:center;font-size:12px;background:#111731;padding:5px 12px;border-radius:10px;border:1px solid #223}
+ #verdict{font-weight:600}
+ .ok{color:#59d98c}.bad{color:#ff7b72}.mid{color:#ffd166}
+ #hint{position:absolute;left:12px;top:34px;font-size:11px;color:#7484ab;pointer-events:none}
+ #bpBox{position:absolute;top:56px;right:12px;background:rgba(13,18,38,.87);border:1px solid #33406e;border-radius:10px;padding:8px 12px;pointer-events:none;text-align:right}
+ #bpBox .row{display:flex;gap:8px;align-items:baseline;justify-content:flex-end;margin:1px 0}
+ #bpBox .lbl{font-size:10px;color:#7484ab;width:64px}
+ #bpBox .val{font-family:'SF Mono',Menlo,Consolas,monospace;font-size:21px;font-weight:700;color:#58c4ff}
+ #bpBox .val.near{font-size:14px;color:#ff8bd2}
+ #bpBox .unit{font-size:10px;color:#7484ab}
+</style>
+</head>
+<body>
+<h1>Пульсовая волна в артерии — 3D: упругость стенки → скорость волны → фаза отражения → усиление давления</h1>
+
+<div class="controls panel">
+  <div class="ctl"><label>Упругость стенки → PWV: <b id="eVal"></b></label><input id="eSlider" type="range" min="0" max="100" value="17"></div>
+  <div class="ctl"><label>Пульс: <b id="hrVal"></b> уд/мин</label><input id="hrSlider" type="range" min="45" max="130" value="65"></div>
+  <div class="ctl"><label>Замедление: <b id="spVal"></b></label><input id="spSlider" type="range" min="1" max="20" value="10"></div>
+  <div class="btns">
+    <button data-pwv="5.0">Молодая аорта</button>
+    <button data-pwv="8.0">Возраст ~50</button>
+    <button data-pwv="13.0" class="warn">Склероз</button>
+    <button id="pauseBtn">&#9208;</button>
+    <button id="resetBtn">Сброс</button>
+  </div>
+</div>
+
+<div class="vessel-wrap panel">
+  <canvas id="vessel"></canvas>
+  <div id="hint">тяните мышью — вращение · колесо — зум<br>светящиеся точки — клетки крови: у сердца поток рывками, к капиллярам — ровный</div>
+  <div id="bpBox">
+    <div class="row"><span class="lbl">периферия</span><span class="val" id="bpFar">—/—</span><span class="unit">мм рт.ст.</span></div>
+    <div class="row"><span class="lbl">аорта</span><span class="val near" id="bpNear">—/—</span><span class="unit">мм рт.ст.</span></div>
+  </div>
+</div>
+
+<div id="status" class="panel">
+  <span>PWV: <b id="pwvOut"></b></span>
+  <span>Период T: <b id="tOut"></b></span>
+  <span>Возврат 2L/PWV: <b id="retOut"></b></span>
+  <span id="verdict"></span>
+</div>
+
+<div class="chart-wrap panel"><canvas id="chart"></canvas></div>
+
+<script>
+'use strict';
+const N = 520, L = 1.0, dx = L / (N - 1);
+
+let PWV = 6.0, HR = 65, slowMo = 10, paused = false, simT = 0;
+
+function makeSim() {
+  return { p: new Float32Array(N), pp: new Float32Array(N), pn: new Float32Array(N) };
+}
+const simTotal = makeSim();
+const simInc = makeSim();
+let samples = [];
+
+const MMHG_MEAN = 93, MMHG_SCALE = 24;
+const NEAR_IDX = Math.round(0.12 * (N - 1)), FAR_IDX = Math.round(0.88 * (N - 1));
+let cycKey = -1, cFar = { mx: -99, mn: 99 }, cNear = { mx: -99, mn: 99 };
+let flowM = 0;
+const envHist = [];
+
+const vesselCv = document.getElementById('vessel'),
+      vctx = vesselCv.getContext('2d'),
+      chartCv = document.getElementById('chart'),
+      cctx = chartCv.getContext('2d'),
+      vWrap = document.querySelector('.vessel-wrap'),
+      cWrap = document.querySelector('.chart-wrap');
+let VW = 0, VH = 0, CW = 0, CH = 0;
+
+function watchCanvas(cv, cx, holder, setSize) {
+  const dpr = window.devicePixelRatio || 1;
+  new ResizeObserver(() => {
+    const r = holder.getBoundingClientRect();
+    cv.width = Math.max(60, Math.round(r.width * dpr));
+    cv.height = Math.max(60, Math.round(r.height * dpr));
+    cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    setSize(r.width, r.height);
+  }).observe(holder);
+}
+watchCanvas(vesselCv, vctx, vWrap, (w, h) => { VW = w; VH = h; });
+watchCanvas(chartCv, cctx, cWrap, (w, h) => { CW = w; CH = h; });
+
+const period = () => 60 / HR;
+const sysDur = () => Math.min(0.36, 0.5 * period());
+
+function drive(t) {
+  const T = period(), sd = sysDur();
+  const ph = (t % T) / T, sf = sd / T;
+  let v = 0;
+  if (ph < sf) {
+    v = Math.pow(Math.sin(Math.PI * ph / sf), 1.6);
+  } else {
+    const q = (ph - sf) / 0.09;
+    if (q >= 0 && q < 1) v = 0.16 * Math.sin(Math.PI * q);
+  }
+  return v;
+}
+
+function advance(s, dt, reflect) {
+  const r = Math.min(0.92, PWV * dt / dx);
+  const r2 = r * r;
+  const damp = Math.exp(-0.9 * dt);
+  for (let i = 1; i < N - 1; i++) {
+    s.pn[i] = (2 * s.p[i] - s.pp[i] + r2 * (s.p[i + 1] - 2 * s.p[i] + s.p[i - 1])) * damp;
+  }
+  s.pn[0] = drive(simT + dt);
+  if (reflect) {
+    s.pn[N - 1] = s.pn[N - 2];
+  } else {
+    s.pn[N - 1] = (1 - r) * s.p[N - 1] + r * s.p[N - 2];
+    const z0 = Math.floor(N * 0.88);
+    for (let i = z0; i < N; i++) s.pn[i] *= 1 - ((i - z0) / (N - z0)) * 0.5;
+  }
+  const tmp = s.pp; s.pp = s.p; s.p = s.pn; s.pn = tmp;
+}
+
+function lerp(a, b, k) { return a + (b - a) * k; }
+
+function colRGB(v) {
+  const base = [30, 50, 115];
+  const tgt = v > 0 ? [255, 82, 82] : [26, 200, 255];
+  const k = Math.min(1, Math.abs(v));
+  return [
+    Math.round(lerp(base[0], tgt[0], k)),
+    Math.round(lerp(base[1], tgt[1], k)),
+    Math.round(lerp(base[2], tgt[2], k))
+  ];
+}
+const shade = (rgb, k) => `rgb(${Math.min(255,Math.round(rgb[0]*k))},${Math.min(255,Math.round(rgb[1]*k))},${Math.min(255,Math.round(rgb[2]*k))})`;
+
+const NS = 130, NT = 20;
+const idxMap = new Int16Array(NS);
+for (let k = 0; k < NS; k++) idxMap[k] = Math.round(k * (N - 1) / (NS - 1));
+
+const PART_N = 280;
+const partX = new Float32Array(PART_N),
+      partTh = new Float32Array(PART_N),
+      partRho = new Float32Array(PART_N);
+for (let i = 0; i < PART_N; i++) {
+  partX[i] = Math.random();
+  partTh[i] = Math.random() * Math.PI * 2;
+  partRho[i] = 0.15 + Math.random() * 0.62;
+}
+
+let yaw = -0.55, pitch = -0.30, dist = 1050, autoRot = true;
+let dragging = false, lastMX = 0, lastMY = 0, idleSince = 0;
+
+vesselCv.addEventListener('mousedown', e => {
+  dragging = true; autoRot = false;
+  lastMX = e.clientX; lastMY = e.clientY;
+});
+window.addEventListener('mouseup', () => { dragging = false; idleSince = performance.now(); });
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  yaw += (e.clientX - lastMX) * 0.008;
+  pitch += (e.clientY - lastMY) * 0.006;
+  pitch = Math.max(-1.25, Math.min(1.25, pitch));
+  lastMX = e.clientX; lastMY = e.clientY;
+});
+vesselCv.addEventListener('touchstart', e => {
+  autoRot = false; dragging = true;
+  lastMX = e.touches[0].clientX; lastMY = e.touches[0].clientY;
+}, { passive: true });
+vesselCv.addEventListener('touchmove', e => {
+  if (!dragging) return;
+  yaw += (e.touches[0].clientX - lastMX) * 0.008;
+  pitch += (e.touches[0].clientY - lastMY) * 0.006;
+  pitch = Math.max(-1.25, Math.min(1.25, pitch));
+  lastMX = e.touches[0].clientX; lastMY = e.touches[0].clientY;
+}, { passive: true });
+window.addEventListener('touchend', () => { dragging = false; idleSince = performance.now(); });
+vesselCv.addEventListener('wheel', e => {
+  e.preventDefault();
+  dist = Math.max(550, Math.min(1900, dist + e.deltaY * 0.9));
+  autoRot = false;
+}, { passive: false });
+
+const LEN = 780, X0 = -LEN / 2, XC = 0, YC = 8, F = 980;
+
+function baseR(xw) {
+  const u = (xw - X0) / LEN;
+  if (u < 0.84) return 46;
+  if (u < 0.92) return lerp(46, 15, (u - 0.84) / 0.08);
+  return 15;
+}
+
+function project(x, y, z) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const x1 = x * cy - z * sy;
+  const z1 = x * sy + z * cy;
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const y2 = y * cp - z1 * sp;
+  const z2 = y * sp + z1 * cp;
+  const depth = dist - z2;
+  const s = F / Math.max(120, depth);
+  return [VW / 2 + x1 * s, VH / 2 + 14 - y2 * s, depth, s];
+}
+
+function drawGrid(g) {
+  g.lineWidth = 1;
+  const gy = -78;
+  for (let gx = X0 - 90; gx <= X0 + LEN + 90; gx += 90) {
+    const a = project(gx, gy, -170), b = project(gx, gy, 170);
+    g.strokeStyle = `rgba(90,110,170,${0.16 / (1 + Math.max(0, a[2] - dist) * 0.002)})`;
+    g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+  }
+  for (let gz = -170; gz <= 170; gz += 85) {
+    const a = project(X0 - 90, gy, gz), b = project(X0 + LEN + 90, gy, gz);
+    g.strokeStyle = `rgba(90,110,170,${0.16 / (1 + Math.max(0, a[2] - dist) * 0.002)})`;
+    g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+  }
+}
+
+function ringPoints(xw, r) {
+  const pts = [];
+  for (let it = 0; it <= NT; it++) {
+    const th = it / NT * Math.PI * 2;
+    pts.push(project(xw, YC + r * Math.cos(th), r * Math.sin(th)));
+  }
+  return pts;
+}
+
+function drawRing(g, pts, color, width, glow) {
+  g.strokeStyle = color;
+  g.lineWidth = width;
+  if (glow) { g.shadowColor = color; g.shadowBlur = glow; }
+  g.beginPath();
+  g.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]);
+  g.stroke();
+  g.shadowBlur = 0;
+}
+
+function drawVessel() {
+  if (!VW || !VH) return;
+  const g = vctx;
+  g.clearRect(0, 0, VW, VH);
+
+  if (autoRot && performance.now() - idleSince > 2500) yaw += 0.0028;
+
+  drawGrid(g);
+
+  const comp = Math.min(1.6, Math.max(0.35, (6.5 / PWV) ** 2));
+  const ampPx = Math.min(30, 26 * comp);
+  const LX = [-0.45, 0.75, -0.55];
+  const LN = Math.hypot(LX[0], LX[1], LX[2]);
+
+  const verts = [];
+  for (let k = 0; k < NS; k++) {
+    const xw = X0 + k / (NS - 1) * LEN;
+    const pv = Math.max(-1.1, Math.min(1.1, simTotal.p[idxMap[k]]));
+    const r = Math.max(5, baseR(xw) + pv * ampPx);
+    for (let it = 0; it <= NT; it++) {
+      const th = it / NT * Math.PI * 2;
+      verts.push([xw, YC + r * Math.cos(th), r * Math.sin(th)]);
+    }
+  }
+
+  const quads = [];
+  for (let k = 0; k < NS - 1; k++) {
+    for (let it = 0; it < NT; it++) {
+      const i0 = k * (NT + 1) + it;
+      const A = verts[i0], B = verts[i0 + NT + 1], C = verts[i0 + NT + 2], D = verts[i0 + 1];
+      const u = [B[0]-A[0], B[1]-A[1], B[2]-A[2]];
+      const w = [D[0]-A[0], D[1]-A[1], D[2]-A[2]];
+      let nx = u[1]*w[2]-u[2]*w[1];
+      let ny = u[2]*w[0]-u[0]*w[2];
+      let nz = u[0]*w[1]-u[1]*w[0];
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      nx /= nl; ny /= nl; nz /= nl;
+      const cxw = (A[0]+B[0]+C[0]+D[0])/4, cyw = (A[1]+B[1]+C[1]+D[1])/4, czw = (A[2]+B[2]+C[2]+D[2])/4;
+      let vx = cxw, vy = cyw - YC, vz = czw;
+      const vl = Math.hypot(vx, vy, vz) || 1;
+      vx /= vl; vy /= vl; vz /= vl;
+      if (nx*vx + ny*vy + nz*vz < 0) { nx=-nx; ny=-ny; nz=-nz; }
+      const cy = Math.cos(yaw), sy = Math.sin(yaw);
+      const nx1 = nx*cy - nz*sy, nz1 = nx*sy + nz*cy;
+      const cp = Math.cos(pitch), sp = Math.sin(pitch);
+      const ny2 = ny*cp - nz1*sp, nz2 = ny*sp + nz1*cp;
+      const diff = Math.max(0, nx1*LX[0]/LN + ny2*LX[1]/LN + nz2*LX[2]/LN);
+      const pa = (simTotal.p[idxMap[k]] + simTotal.p[idxMap[Math.min(k+1,NS-1)]]) / 2;
+      const rgb = colRGB(pa);
+      quads.push([
+        project(A[0],A[1],A[2]), project(B[0],B[1],B[2]),
+        project(C[0],C[1],C[2]), project(D[0],D[1],D[2]),
+        diff, rgb, (project(cxw,cyw,czw))[2]
+      ]);
+    }
+  }
+  quads.sort((a, b) => b[6] - a[6]);
+
+  for (const q of quads) {
+    const depthK = 1 / (1 + Math.max(0, q[6] - dist) * 0.0016);
+    const lit = (0.38 + 0.72 * q[4]) * (0.45 + 0.55 * depthK);
+    g.fillStyle = shade(q[5], lit);
+    g.beginPath();
+    g.moveTo(q[0][0], q[0][1]);
+    g.lineTo(q[1][0], q[1][1]);
+    g.lineTo(q[2][0], q[2][1]);
+    g.lineTo(q[3][0], q[3][1]);
+    g.closePath();
+    g.fill();
+  }
+
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = 'rgba(190,214,255,0.8)';
+  for (let i = 0; i < PART_N; i++) {
+    const xw = X0 + partX[i] * LEN;
+    const rIn = Math.max(5, baseR(xw)) - 7;
+    if (rIn < 6) continue;
+    const rr = rIn * partRho[i];
+    const pr = project(xw, YC + rr * Math.cos(partTh[i]), rr * Math.sin(partTh[i]));
+    const rad = Math.max(0.8, Math.min(3.6, 2.4 * pr[3]));
+    g.beginPath();
+    g.arc(pr[0], pr[1], rad, 0, Math.PI * 2);
+    g.fill();
+  }
+  g.restore();
+
+  const T = period(), tau = simT % T, tEnd = L / PWV;
+  let fxPos = null, rxPos = null;
+  if (tau < tEnd) fxPos = Math.min(PWV * tau, L);
+  else rxPos = L - PWV * (tau - tEnd);
+  if (fxPos !== null && fxPos > 0.01 * L)
+    drawRing(g, ringPoints(X0 + fxPos / L * LEN, baseR(X0 + fxPos/L*LEN) + 8), '#ff6b57', 3, 14);
+  if (rxPos !== null && rxPos > 0.03 * L)
+    drawRing(g, ringPoints(X0 + rxPos / L * LEN, baseR(X0 + rxPos/L*LEN) + 8), '#ffb14d', 3, 14);
+
+  for (const [xi, lbl, c] of [[0.12, 'датчик 1', '#ff8bd2'], [0.88, 'датчик 2', '#58c4ff']]) {
+    const xw = X0 + xi * LEN;
+    drawRing(g, ringPoints(xw, baseR(xw) + 4), c, 1.5, 6);
+    const pr = project(xw, YC + baseR(xw) + 42, 0);
+    g.fillStyle = c;
+    g.font = '11px sans-serif';
+    g.textAlign = 'center';
+    g.fillText(lbl, pr[0], pr[1]);
+  }
+
+  const beat = drive(simT);
+  const hp = project(X0 - 92, YC, 0);
+  const hr = (26 + 13 * beat) * hp[3];
+  const gr = g.createRadialGradient(hp[0] - hr * 0.3, hp[1] - hr * 0.3, hr * 0.2, hp[0], hp[1], hr);
+  gr.addColorStop(0, '#ff8fa0');
+  gr.addColorStop(1, '#c22740');
+  g.fillStyle = gr;
+  g.beginPath();
+  g.arc(hp[0], hp[1], hr, 0, Math.PI * 2);
+  g.fill();
+  g.fillStyle = '#ffb3bd';
+  g.font = '12px sans-serif';
+  g.textAlign = 'center';
+  g.fillText('Сердце', hp[0], hp[1] + hr + 16);
+  g.fillStyle = '#ffd166';
+  g.font = '11px sans-serif';
+  g.fillText(`удар №${Math.floor(simT / period()) + 1}`, hp[0], hp[1] + hr + 32);
+
+  const tp = project(X0 + LEN + 60, YC, 0);
+  g.fillStyle = '#8fa3c8';
+  g.font = '11px sans-serif';
+  g.fillText('артериолы:', tp[0], tp[1] - 34);
+  g.fillText('высокое сопротивление,', tp[0], tp[1] - 20);
+  g.fillText('главный отражатель', tp[0], tp[1] - 6);
+
+  g.textAlign = 'right';
+  g.fillStyle = '#ff6b57';
+  g.beginPath(); g.arc(VW - 176, 20, 5, 0, Math.PI*2); g.fill();
+  g.textAlign = 'left'; g.fillText('фронт прямой волны (кольцо)', VW - 166, 24);
+  g.fillStyle = '#ffb14d';
+  g.textAlign = 'right'; g.beginPath(); g.arc(VW - 176, 38, 5, 0, Math.PI*2); g.fill();
+  g.textAlign = 'left'; g.fillText('отражённая волна', VW - 166, 42);
+  g.fillStyle = '#7484ab';
+  g.fillText(`PWV ${PWV.toFixed(1)} м/с · жёсткость ↑ → прогиб стенки ↓`, 12, VH - 12);
+
+  if (VH >= 250) drawFlowBar(g);
+  if (VH >= 300) {
+    drawPhaseCaption(g, tau, T, tEnd);
+    drawTimeline(g, tau, T);
+  }
+}
+
+function drawFlowBar(g) {
+  const bx = 14, bw = 78, by = VH - 46, bh = 9;
+  g.fillStyle = 'rgba(255,255,255,0.07)';
+  roundRect(g, bx, by, bw, bh, 4);
+  g.fill();
+  const f = Math.max(0.02, Math.min(1, flowM));
+  g.fillStyle = '#59d98c';
+  roundRect(g, bx, by, Math.max(3, bw * f), bh, 4);
+  g.fill();
+  g.fillStyle = '#7484ab';
+  g.font = '9px sans-serif';
+  g.textAlign = 'left';
+  g.fillText('разгон кровотока', bx, by - 5);
+}
+
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+function phaseMsg(tau, T, tEnd) {
+  const sd = sysDur(), ret = 2 * L / PWV;
+  if (tau < tEnd) return ['① Сердце выбросило кровь — волна давления бежит к периферии', '#ff6b57'];
+  if (tau < ret) return ['② Волна дошла до артериол — отражается и бежит обратно', '#ffb14d'];
+  if (ret <= sd) return ['③ Отражение вернулось ЕЩЁ В СИСТОЛУ → сложилось с прямой волной, пик давления выше!', '#ff7b72'];
+  return ['③ Отражение вернулось в ДИАСТОЛУ → мягко поддерживает давление между ударами', '#59d98c'];
+}
+
+function drawPhaseCaption(g, tau, T, tEnd) {
+  const [msg, color] = phaseMsg(tau, T, tEnd);
+  g.font = '600 13px sans-serif';
+  const w = g.measureText(msg).width + 28;
+  const x = (VW - w) / 2, y = VH - 84, h = 27;
+  g.fillStyle = 'rgba(13,18,38,0.85)';
+  roundRect(g, x, y, w, h, 8);
+  g.fill();
+  g.strokeStyle = color;
+  g.lineWidth = 1.2;
+  roundRect(g, x, y, w, h, 8);
+  g.stroke();
+  g.fillStyle = color;
+  g.textAlign = 'left';
+  g.textBaseline = 'middle';
+  g.fillText(msg, x + 14, y + h / 2 + 0.5);
+  g.textBaseline = 'alphabetic';
+}
+
+function drawTimeline(g, tau, T) {
+  const bx = 98, bw = VW - 196, by = VH - 42, bh = 12;
+  const sd = sysDur();
+  g.fillStyle = 'rgba(255,255,255,0.06)';
+  roundRect(g, bx, by, bw, bh, 6); g.fill();
+  g.fillStyle = 'rgba(255,110,110,0.25)';
+  roundRect(g, bx, by, bw * sd / T, bh, 6); g.fill();
+
+  g.font = '10px sans-serif';
+  g.fillStyle = 'rgba(255,170,170,0.75)';
+  g.textAlign = 'left';
+  g.fillText('систола', bx + 4, by - 4);
+  g.fillStyle = 'rgba(160,190,230,0.6)';
+  g.fillText('диастола', bx + bw * sd / T + 4, by - 4);
+
+  const ev = [
+    [0, 'старт', '#ff6b57'],
+    [(L / PWV) / T, 'отражение', '#ffb14d'],
+    [(2 * L / PWV) / T, 'возврат', '#59d98c']
+  ];
+  g.textAlign = 'center';
+  for (const [fr, lbl, c] of ev) {
+    const x = bx + fr * bw;
+    g.strokeStyle = c;
+    g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(x, by - 2); g.lineTo(x, by + bh + 2); g.stroke();
+    g.fillStyle = c;
+    g.beginPath(); g.arc(x, by + bh / 2, 3, 0, Math.PI * 2); g.fill();
+    g.fillText(lbl, x, by + bh + 12);
+  }
+
+  const px = bx + (tau % T) / T * bw;
+  g.strokeStyle = 'rgba(255,255,255,0.85)';
+  g.lineWidth = 2;
+  g.beginPath(); g.moveTo(px, by - 3); g.lineTo(px, by + bh + 3); g.stroke();
+}
+
+function drawChart() {
+  if (!CW || !CH) return;
+  const g = cctx;
+  g.clearRect(0, 0, CW, CH);
+  const win = 4 * period();
+  const t0 = simT - win;
+  const yOfMm = mm => CH - 16 - (mm - 40) * (CH - 32) / 130;
+  const yOf = v => yOfMm(MMHG_MEAN + v * MMHG_SCALE);
+  const xOf = t => (t - t0) / win * CW;
+
+  g.strokeStyle = 'rgba(255,255,255,0.07)';
+  g.lineWidth = 1;
+  for (let tt = Math.ceil(t0 / period()) * period(); tt < simT; tt += period()) {
+    const x = xOf(tt);
+    g.beginPath(); g.moveTo(x, 6); g.lineTo(x, CH - 8); g.stroke();
+  }
+  g.beginPath(); g.moveTo(0, CH - 16); g.lineTo(CW, CH - 16); g.stroke();
+
+  const yNhi = yOfMm(120), yNlo = yOfMm(80);
+  g.fillStyle = 'rgba(89,217,140,0.06)';
+  g.fillRect(28, yNhi, CW - 28, yNlo - yNhi);
+
+  g.font = '9px sans-serif';
+  g.textAlign = 'left';
+  for (let m = 60; m <= 160; m += 20) {
+    if (m === 120 || m === 80) continue;
+    const y = yOfMm(m);
+    g.strokeStyle = 'rgba(255,255,255,0.055)';
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(28, y); g.lineTo(CW, y); g.stroke();
+    g.fillStyle = '#5c6b8f';
+    g.fillText(String(m), 6, y + 3);
+  }
+  g.strokeStyle = 'rgba(89,217,140,0.5)';
+  g.lineWidth = 1.3;
+  g.setLineDash([7, 5]);
+  g.font = 'bold 10px sans-serif';
+  for (const m of [120, 80]) {
+    const y = m === 120 ? yNhi : yNlo;
+    g.beginPath(); g.moveTo(28, y); g.lineTo(CW, y); g.stroke();
+    g.fillStyle = 'rgba(89,217,140,0.95)';
+    g.fillText(String(m), 6, y + 3);
+  }
+  g.setLineDash([]);
+  g.fillStyle = 'rgba(89,217,140,0.55)';
+  g.font = '9px sans-serif';
+  g.fillText('НОРМА', 36, (yNhi + yNlo) / 2 + 3);
+  g.fillStyle = '#5c6b8f';
+  g.fillText('мм рт.ст.', 6, CH - 5);
+
+  const hasLive = cycKey >= 0 && cFar.mx > -50;
+  if (envHist.length > 0 || hasLive) {
+    const tops = [], bots = [];
+    for (const e of envHist) {
+      if (e.t < t0) continue;
+      tops.push([xOf(e.t), yOfMm(MMHG_MEAN + e.mx * MMHG_SCALE)]);
+      bots.push([xOf(e.t), yOfMm(MMHG_MEAN + e.mn * MMHG_SCALE)]);
+    }
+    if (hasLive) {
+      tops.push([CW, yOfMm(MMHG_MEAN + cFar.mx * MMHG_SCALE)]);
+      bots.push([CW, yOfMm(MMHG_MEAN + cFar.mn * MMHG_SCALE)]);
+    }
+    if (tops.length >= 2) {
+      g.fillStyle = 'rgba(88,196,255,0.10)';
+      g.beginPath();
+      g.moveTo(tops[0][0], tops[0][1]);
+      for (let i = 1; i < tops.length; i++) g.lineTo(tops[i][0], tops[i][1]);
+      for (let i = bots.length - 1; i >= 0; i--) g.lineTo(bots[i][0], bots[i][1]);
+      g.closePath();
+      g.fill();
+    }
+  }
+
+  g.fillStyle = 'rgba(255,70,70,0.14)';
+  for (let i = 1; i < samples.length; i++) {
+    const a = samples[i - 1], b = samples[i];
+    if (a.t < t0 || b.t < t0) continue;
+    if (a.far > a.farInc && b.far > b.farInc) {
+      g.beginPath();
+      g.moveTo(xOf(a.t), yOf(a.far));
+      g.lineTo(xOf(b.t), yOf(b.far));
+      g.lineTo(xOf(b.t), yOf(b.farInc));
+      g.lineTo(xOf(a.t), yOf(a.farInc));
+      g.closePath(); g.fill();
+    }
+  }
+
+  const dashPlot = (getVal, color) => {
+    g.strokeStyle = color;
+    g.lineWidth = 1.5;
+    g.setLineDash([5, 4]);
+    g.beginPath();
+    let started = false;
+    for (const s of samples) {
+      if (s.t < t0) continue;
+      const x = xOf(s.t), y = yOf(getVal(s));
+      if (!started) { g.moveTo(x, y); started = true; } else g.lineTo(x, y);
+    }
+    g.stroke();
+    g.setLineDash([]);
+  };
+
+  dashPlot(s => s.farInc, '#8fa3c8');
+  dashPlot(s => s.far - s.farInc, '#ffb14d');
+
+  const plot = (key, color) => {
+    g.strokeStyle = color;
+    g.lineWidth = 2.2;
+    g.beginPath();
+    let started = false;
+    for (const s of samples) {
+      if (s.t < t0) continue;
+      const x = xOf(s.t), y = yOf(s[key]);
+      if (!started) { g.moveTo(x, y); started = true; } else g.lineTo(x, y);
+    }
+    g.stroke();
+  };
+  plot('near', '#ff8bd2');
+  plot('far', '#58c4ff');
+
+  if (cFar.mx > -50) {
+    const mmS = Math.round(MMHG_MEAN + cFar.mx * MMHG_SCALE);
+    const mmD = Math.round(MMHG_MEAN + cFar.mn * MMHG_SCALE);
+    let yS = yOfMm(mmS), yD = yOfMm(mmD);
+    if (Math.abs(yS - yD) < 13) yD = yS + (yD >= yS ? 13 : -13);
+    g.font = 'bold 10px sans-serif';
+    for (const [y, val] of [[yS, mmS], [yD, mmD]]) {
+      g.fillStyle = '#58c4ff';
+      g.beginPath();
+      g.moveTo(CW - 4, y); g.lineTo(CW - 11, y - 5); g.lineTo(CW - 11, y + 5);
+      g.closePath(); g.fill();
+      g.textAlign = 'right';
+      g.fillText(String(val), CW - 16, y + 3.5);
+    }
+    g.textAlign = 'left';
+  }
+
+  g.font = '11px sans-serif';
+  g.textAlign = 'left';
+  g.fillStyle = '#9fb0d8';
+  g.fillText('Давление во времени (датчик 2 у периферии); зелёная полоса — норма, линии — начало цикла', 10, 14);
+  g.textAlign = 'right';
+  g.fillStyle = '#58c4ff';
+  g.fillText('— сумма (реальное давление)', CW - 12, 14);
+  g.fillStyle = '#8fa3c8';
+  g.fillText('- - только прямая волна (как если бы отражения не было)', CW - 12, 29);
+  g.fillStyle = '#ffb14d';
+  g.fillText('- - вклад отражённой волны', CW - 12, 44);
+}
+
+function updateStatus() {
+  const T = period(), ret = 2 * L / PWV, sd = sysDur();
+  document.getElementById('pwvOut').textContent = PWV.toFixed(1) + ' м/с';
+  document.getElementById('tOut').textContent = T.toFixed(2) + ' с';
+  document.getElementById('retOut').textContent = ret.toFixed(2) + ' с';
+  const v = document.getElementById('verdict');
+  if (ret <= sd) {
+    v.className = 'bad';
+    v.textContent = '⚠ Отражение приходит В СИСТОЛУ → волны складываются, пик давления усиливается';
+  } else if (ret <= sd * 1.25) {
+    v.className = 'mid';
+    v.textContent = '~ Отражение приходит к концу систолы — начало усиления';
+  } else {
+    v.className = 'ok';
+    v.textContent = '✓ Отражение приходит В ДИАСТОЛУ → поддерживает поток (норма)';
+  }
+}
+
+const elBpFar = document.getElementById('bpFar'),
+      elBpNear = document.getElementById('bpNear');
+
+function updateBp() {
+  if (cFar.mx < -50) {
+    elBpFar.textContent = '—/—';
+    elBpNear.textContent = '—/—';
+    return;
+  }
+  elBpFar.textContent =
+    Math.round(MMHG_MEAN + cFar.mx * MMHG_SCALE) + '/' +
+    Math.round(MMHG_MEAN + cFar.mn * MMHG_SCALE);
+  elBpNear.textContent =
+    Math.round(MMHG_MEAN + cNear.mx * MMHG_SCALE) + '/' +
+    Math.round(MMHG_MEAN + cNear.mn * MMHG_SCALE);
+}
+
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dtr = (now - last) / 1000;
+  last = now;
+  if (dtr > 0.06) dtr = 0.06;
+  if (!paused) {
+    const simDt = dtr / slowMo;
+    const dtMax = 0.85 * dx / PWV;
+    const n = Math.max(1, Math.ceil(simDt / dtMax));
+    const ds = simDt / n;
+    for (let k = 0; k < n; k++) {
+      advance(simTotal, ds, true);
+      advance(simInc, ds, false);
+      simT += ds;
+    }
+    samples.push({
+      t: simT,
+      near: simTotal.p[Math.round(0.12 * (N - 1))],
+      far: simTotal.p[Math.round(0.88 * (N - 1))],
+      farInc: simInc.p[Math.round(0.88 * (N - 1))]
+    });
+    while (samples.length && samples[0].t < simT - 4 * period()) samples.shift();
+
+    const key = Math.floor(simT / period());
+    if (key !== cycKey) {
+      if (cycKey >= 0 && cFar.mx > -50) {
+        envHist.push({ t: key * period(), mx: cFar.mx, mn: cFar.mn });
+        while (envHist.length && envHist[0].t < simT - 4.2 * period()) envHist.shift();
+      }
+      cycKey = key;
+      cFar.mx = -99; cFar.mn = 99;
+      cNear.mx = -99; cNear.mn = 99;
+    }
+    flowM += (drive(simT) * 6.5 - flowM * 1.7) * simDt;
+    if (flowM < 0) flowM = 0;
+    const fv = simTotal.p[FAR_IDX], nv = simTotal.p[NEAR_IDX];
+    if (fv > cFar.mx) cFar.mx = fv;
+    if (fv < cFar.mn) cFar.mn = fv;
+    if (nv > cNear.mx) cNear.mx = nv;
+    if (nv < cNear.mn) cNear.mn = nv;
+
+    const lamFrac = 0.18 + 0.30 * (PWV / 6.5) ** 2;
+    const mCl = Math.min(1, flowM);
+    const vMean = LEN / 2.6 * (0.06 + 0.94 * mCl), vPuls0 = 520;
+    const beatNow = drive(simT);
+    for (let i = 0; i < PART_N; i++) {
+      const decay = Math.exp(-partX[i] / lamFrac);
+      partX[i] += ((vMean + vPuls0 * decay * beatNow * (0.3 + 0.7 * mCl)) / LEN) * simDt;
+      if (partX[i] > 1.012) partX[i] -= 1.012 + Math.random() * 0.02;
+      else if (partX[i] < 0) partX[i] = 0.001;
+    }
+  }
+  drawVessel();
+  drawChart();
+  updateStatus();
+  updateBp();
+}
+
+const eSlider = document.getElementById('eSlider');
+const hrSlider = document.getElementById('hrSlider');
+const spSlider = document.getElementById('spSlider');
+
+function applyE() {
+  PWV = 4.5 + (eSlider.value / 100) * 9;
+  document.getElementById('eVal').textContent = PWV.toFixed(1) + ' м/с';
+}
+function applyHr() {
+  HR = +hrSlider.value;
+  document.getElementById('hrVal').textContent = HR;
+}
+function applySp() {
+  slowMo = +spSlider.value;
+  document.getElementById('spVal').textContent = '×' + slowMo;
+}
+eSlider.addEventListener('input', applyE);
+hrSlider.addEventListener('input', applyHr);
+spSlider.addEventListener('input', applySp);
+
+document.querySelectorAll('button[data-pwv]').forEach(b => {
+  b.addEventListener('click', () => {
+    eSlider.value = Math.round((parseFloat(b.dataset.pwv) - 4.5) / 9 * 100);
+    applyE();
+  });
+});
+
+document.getElementById('pauseBtn').addEventListener('click', function () {
+  paused = !paused;
+  this.innerHTML = paused ? '&#9654;' : '&#9208;';
+});
+document.getElementById('resetBtn').addEventListener('click', () => {
+  simTotal.p.fill(0); simTotal.pp.fill(0); simTotal.pn.fill(0);
+  simInc.p.fill(0); simInc.pp.fill(0); simInc.pn.fill(0);
+  samples.length = 0;
+  simT = 0;
+  cycKey = -1;
+  cFar.mx = -99; cFar.mn = 99;
+  cNear.mx = -99; cNear.mn = 99;
+  flowM = 0;
+  envHist.length = 0;
+});
+
+applyE(); applyHr(); applySp();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
